@@ -1,5 +1,5 @@
 #include <avr/io.h>
-
+// jd assignment
 void setup() {
   DDRB |= 0x01;   // Set PB0 (pin 14) as output
 }
