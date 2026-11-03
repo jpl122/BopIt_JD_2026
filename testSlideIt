@@ -1,0 +1,77 @@
+#define START_PIN 5
+#define FADER_PIN 4
+
+const int SLIDE_THRESHOLD = 500;
+const unsigned long TIME_LIMIT = 3000;
+
+int score = 0;
+
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(START_PIN, INPUT_PULLUP);
+  pinMode(FADER_PIN, INPUT);
+
+  analogReadResolution(12);
+
+  delay(1000);
+  Serial.println("DJ Bop-It Ready!");
+}
+
+void loop() {
+  Serial.println("Press START!");
+
+  // Wait for button press
+  while (digitalRead(START_PIN) == HIGH) {
+    delay(10);
+  }
+
+  delay(30);
+
+  // Wait for button release
+  while (digitalRead(START_PIN) == LOW) {
+    delay(10);
+  }
+
+  score = 0;
+  Serial.println("GAME STARTED!");
+
+  bool gameRunning = true;
+
+  while (gameRunning) {
+    int initialValue = analogRead(FADER_PIN);
+    unsigned long startTime = millis();
+
+    Serial.println("SLIDE IT!");
+
+    bool success = false;
+
+    while (millis() - startTime < TIME_LIMIT) {
+      int currentValue = analogRead(FADER_PIN);
+
+      if (abs(currentValue - initialValue)
+          >= SLIDE_THRESHOLD) {
+        success = true;
+        break;
+      }
+
+      delay(10);
+    }
+
+    if (success) {
+      score++;
+
+      Serial.print("CORRECT! Score: ");
+      Serial.println(score);
+
+      delay(500);
+    } else {
+      Serial.println("TOO SLOW!");
+      gameRunning = false;
+    }
+  }
+
+  Serial.print("FINAL SCORE: ");
+  Serial.println(score);
+  delay(500);
+}
