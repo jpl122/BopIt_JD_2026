@@ -1,0 +1,57 @@
+#include <Wire.h>
+#include <Adafruit_MPR121.h>
+
+Adafruit_MPR121 cap = Adafruit_MPR121();
+
+const int SDA_PIN = 8;
+const int SCL_PIN = 9;
+
+bool lastState = false;
+
+void setup() {
+  Serial.begin(115200);
+  delay(1500);
+
+  Wire.begin(SDA_PIN, SCL_PIN);
+
+  Serial.println("MPR121 E0 TEST");
+
+  if (!cap.begin(0x5A, &Wire)) {
+    Serial.println("MPR121 NOT FOUND");
+    while (1) delay(1000);
+  }
+
+  // Make it a little more sensitive
+  cap.setThresholds(6, 3);
+
+  Serial.println("MPR121 CONNECTED");
+  Serial.println("Touch electrode E0");
+}
+
+void loop() {
+  uint16_t touched = cap.touched();
+
+  bool e0Touched = touched & (1 << 0);
+
+  if (e0Touched && !lastState) {
+    Serial.println("E0 TOUCHED");
+  }
+
+  if (!e0Touched && lastState) {
+    Serial.println("E0 RELEASED");
+  }
+
+  uint16_t filtered = cap.filteredData(0);
+  uint16_t baseline = cap.baselineData(0);
+
+  Serial.print("E0 filtered=");
+  Serial.print(filtered);
+  Serial.print(" baseline=");
+  Serial.print(baseline);
+  Serial.print(" delta=");
+  Serial.println((int)baseline - (int)filtered);
+
+  lastState = e0Touched;
+
+  delay(150);
+}
