@@ -1,0 +1,186 @@
+#include <Arduino.h>
+
+// DJ BOP-IT - ESP32-S3
+// Phase 1: START + SLIDE + LED
+
+#define START_PIN 5
+#define FADER_PIN 4
+#define LED_PIN 18
+
+const int FADER_THRESHOLD = 500;
+const int WIN_SCORE = 99;
+
+const unsigned long INITIAL_TIME = 3000;
+const unsigned long MIN_TIME = 700;
+const unsigned long SPEED_STEP = 100;
+
+// Partial-hardware testing mode
+const bool REQUIRE_ALL_SENSORS = false;
+
+int score = 0;
+int combo = 0;
+unsigned long responseTime = INITIAL_TIME;
+
+// LED feedback
+void flashLED(int count, int duration) {
+  for (int i = 0; i < count; i++) {
+    digitalWrite(LED_PIN, HIGH);
+    delay(duration);
+    digitalWrite(LED_PIN, LOW);
+    delay(duration);
+  }
+}
+
+// Wait for START press
+void waitForStart() {
+  Serial.println();
+  Serial.println("Press START to play!");
+
+  // Make sure button is released
+  while (digitalRead(START_PIN) == LOW) {
+    delay(10);
+  }
+
+  // Wait for press
+  while (digitalRead(START_PIN) == HIGH) {
+    delay(10);
+  }
+
+  delay(30);
+
+  // Wait for release
+  while (digitalRead(START_PIN) == LOW) {
+    delay(10);
+  }
+
+  Serial.println("GAME STARTED!");
+  flashLED(2, 100);
+}
+
+// Check SLIDE IT input
+bool readFader(unsigned long timeLimit) {
+  int startingPosition = analogRead(FADER_PIN);
+
+  unsigned long startTime = millis();
+
+  while (millis() - startTime < timeLimit) {
+    int currentPosition = analogRead(FADER_PIN);
+
+    if (abs(currentPosition - startingPosition)
+        >= FADER_THRESHOLD) {
+
+      Serial.print("Slide detected: ");
+      Serial.println(currentPosition);
+
+      return true;
+    }
+
+    delay(10);
+  }
+
+  return false;
+}
+
+// Correct response
+void showSuccess() {
+  Serial.println("CORRECT!");
+  flashLED(1, 150);
+}
+
+// Incorrect or late response
+void showFailure() {
+  Serial.println("TOO SLOW!");
+  Serial.println("GAME OVER!");
+  flashLED(3, 100);
+}
+
+// Increase difficulty
+void speedUp() {
+  if (responseTime > MIN_TIME + SPEED_STEP) {
+    responseTime -= SPEED_STEP;
+  } else {
+    responseTime = MIN_TIME;
+  }
+}
+
+// Score and combo
+void updateDisplay() {
+  Serial.print("Score: ");
+  Serial.print(score);
+
+  Serial.print(" | Combo: ");
+  Serial.print(combo);
+
+  Serial.print(" | Time: ");
+  Serial.print(responseTime);
+  Serial.println(" ms");
+}
+
+// Final score
+void displayFinalScore() {
+  Serial.println();
+  Serial.println("====================");
+
+  if (score >= WIN_SCORE) {
+    Serial.println("YOU WIN!");
+  } else {
+    Serial.println("GAME OVER!");
+  }
+
+  Serial.print("Final Score: ");
+  Serial.println(score);
+
+  Serial.println("====================");
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  pinMode(START_PIN, INPUT_PULLUP);
+  pinMode(FADER_PIN, INPUT);
+  pinMode(LED_PIN, OUTPUT);
+
+  digitalWrite(LED_PIN, LOW);
+
+  analogReadResolution(12);
+  analogSetPinAttenuation(FADER_PIN, ADC_11db);
+
+  Serial.println("ESP32-S3 DJ BOP-IT READY!");
+}
+
+void loop() {
+  waitForStart();
+
+  score = 0;
+  combo = 0;
+  responseTime = INITIAL_TIME;
+
+  bool gameRunning = true;
+
+  while (gameRunning && score < WIN_SCORE) {
+    Serial.println();
+    Serial.println(">>> SLIDE IT! <<<");
+
+    bool success = readFader(responseTime);
+
+    if (success) {
+      score++;
+      combo++;
+
+      showSuccess();
+      speedUp();
+      updateDisplay();
+
+      delay(300);
+    } else {
+      combo = 0;
+      showFailure();
+      gameRunning = false;
+    }
+  }
+
+  displayFinalScore();
+  delay(500);
+}
+
