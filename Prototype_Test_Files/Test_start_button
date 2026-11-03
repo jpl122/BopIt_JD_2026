@@ -1,0 +1,26 @@
+#define START_PIN 5
+
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(START_PIN, INPUT_PULLUP);
+
+  delay(1000);
+  Serial.println("ESP32-S3 READY");
+  Serial.println("Press START!");
+}
+
+void loop() {
+  if (digitalRead(START_PIN) == LOW) {
+    delay(30); // Debounce
+
+    if (digitalRead(START_PIN) == LOW) {
+      Serial.println("GAME STARTED!");
+
+      // Wait until button is released
+      while (digitalRead(START_PIN) == LOW) {
+        delay(10);
+      }
+    }
+  }
+}
