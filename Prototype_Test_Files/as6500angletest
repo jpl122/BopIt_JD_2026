@@ -1,0 +1,128 @@
+#include <Arduino.h>
+#include <Wire.h>
+
+#define SDA_PIN 8
+#define SCL_PIN 9
+#define AS5600_ADDR 0x36
+
+const int SPIN_THRESHOLD = 250; // ~22 degrees
+const int NOISE_THRESHOLD = 3;
+
+int previousAngle = -1;
+long totalMovement = 0;
+bool spinDetected = false;
+
+bool read8(uint8_t reg, uint8_t &value) {
+  Wire.beginTransmission(AS5600_ADDR);
+  Wire.write(reg);
+
+  if (Wire.endTransmission(false) != 0)
+    return false;
+
+  if (Wire.requestFrom((uint8_t)AS5600_ADDR,
+                       (uint8_t)1) != 1)
+    return false;
+
+  value = Wire.read();
+  return true;
+}
+
+int readAngle() {
+  Wire.beginTransmission(AS5600_ADDR);
+  Wire.write(0x0C); // RAW ANGLE register
+
+  if (Wire.endTransmission(false) != 0)
+    return -1;
+
+  if (Wire.requestFrom((uint8_t)AS5600_ADDR,
+                       (uint8_t)2) != 2)
+    return -1;
+
+  int highByte = Wire.read();
+  int lowByte = Wire.read();
+
+  return ((highByte << 8) | lowByte) & 0x0FFF;
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  Wire.begin(SDA_PIN, SCL_PIN);
+  Wire.setClock(100000);
+
+  Serial.println("AS5600 SPIN IT TEST");
+  Serial.println("Rotate the magnet / wheel");
+}
+
+void loop() {
+  uint8_t status;
+
+  if (!read8(0x0B, status)) {
+    Serial.println("Status read failed");
+    delay(200);
+    return;
+  }
+
+  bool magnetDetected = (status & 0x20) != 0;
+  bool magnetWeak = (status & 0x10) != 0;
+  bool magnetStrong = (status & 0x08) != 0;
+
+  if (!magnetDetected) {
+    Serial.println("MAGNET NOT DETECTED");
+    previousAngle = -1;
+    totalMovement = 0;
+    spinDetected = false;
+    delay(250);
+    return;
+  }
+
+  int angle = readAngle();
+
+  if (angle < 0) {
+    Serial.println("Angle read failed");
+    delay(100);
+    return;
+  }
+
+  if (previousAngle >= 0) {
+    int delta = angle - previousAngle;
+
+    // Correct 0/4095 boundary crossing
+    if (delta > 2048)
+      delta -= 4096;
+
+    if (delta < -2048)
+      delta += 4096;
+
+    if (abs(delta) >= NOISE_THRESHOLD) {
+      totalMovement += abs(delta);
+    }
+  }
+
+  previousAngle = angle;
+
+  float degrees = angle * 360.0 / 4096.0;
+
+  Serial.print("Angle: ");
+  Serial.print(degrees, 1);
+
+  Serial.print(" | Travel: ");
+  Serial.print(totalMovement);
+
+  if (magnetWeak)
+    Serial.print(" | MAGNET WEAK");
+
+  if (magnetStrong)
+    Serial.print(" | MAGNET STRONG");
+
+  Serial.println();
+
+  if (!spinDetected &&
+      totalMovement >= SPIN_THRESHOLD) {
+    spinDetected = true;
+    Serial.println(">>> SPIN IT DETECTED! <<<");
+  }
+
+  delay(50);
+}
