@@ -1,0 +1,686 @@
+
+#include <Arduino.h>
+#include <Wire.h>
+
+// ============================================
+// DJ BOP-IT - ESP32-S3
+// ECE 1895 DESIGN PROJECT #2
+//
+// TAP   = MPR121 raw register data
+// SPIN  = Bourns rotary potentiometer
+// SLIDE = Linear slide potentiometer
+// START = Pushbutton
+// LED   = Success/failure indicator
+// ============================================
+
+// ---------- GPIO PINS ----------
+#define START_PIN 5
+#define SLIDE_PIN 4
+#define SPIN_PIN 6
+#define LED_PIN 18
+
+#define SDA_PIN 8
+#define SCL_PIN 9
+
+// ---------- MPR121 ----------
+#define MPR_ADDR 0x5A
+#define NUM_PADS 3
+
+// Software touch thresholds
+// Calibrate using your measured deltas
+int touchThreshold[3] = {10, 10, 10};
+int releaseThreshold[3] = {5, 5, 5};
+
+bool padState[3] = {false, false, false};
+uint8_t padCount[3] = {0, 0, 0};
+
+// ---------- SENSOR THRESHOLDS ----------
+const int SLIDE_THRESHOLD = 500;
+const int SPIN_THRESHOLD = 80;
+
+// ---------- GAME SETTINGS ----------
+const int WIN_SCORE = 99;
+
+const unsigned long INITIAL_TIME = 3000;
+const unsigned long MIN_TIME = 700;
+const unsigned long SPEED_STEP = 100;
+
+// false allows the game to run without MPR121
+// true requires MPR121 to be connected
+const bool REQUIRE_ALL_SENSORS = false;
+
+// ---------- VARIABLES ----------
+bool mprConnected = false;
+
+int score = 0;
+int combo = 0;
+
+unsigned long responseTime = INITIAL_TIME;
+
+int slideStart = 0;
+int spinStart = 0;
+
+// ---------- GAME COMMANDS ----------
+enum Command {
+  TAP_IT,
+  SPIN_IT,
+  SLIDE_IT
+};
+
+enum Result {
+  CORRECT,
+  WRONG,
+  TIMEOUT
+};
+
+// ============================================
+// I2C REGISTER FUNCTIONS
+// ============================================
+
+bool writeReg(uint8_t reg, uint8_t value) {
+  Wire.beginTransmission(MPR_ADDR);
+  Wire.write(reg);
+  Wire.write(value);
+
+  return Wire.endTransmission() == 0;
+}
+
+bool readReg8(uint8_t reg, uint8_t &value) {
+  Wire.beginTransmission(MPR_ADDR);
+  Wire.write(reg);
+
+  if (Wire.endTransmission(false) != 0)
+    return false;
+
+  if (Wire.requestFrom(
+      (uint8_t)MPR_ADDR, (uint8_t)1) != 1)
+    return false;
+
+  value = Wire.read();
+  return true;
+}
+
+bool readReg16(uint8_t reg, uint16_t &value) {
+  Wire.beginTransmission(MPR_ADDR);
+  Wire.write(reg);
+
+  if (Wire.endTransmission(false) != 0)
+    return false;
+
+  if (Wire.requestFrom(
+      (uint8_t)MPR_ADDR, (uint8_t)2) != 2)
+    return false;
+
+  uint8_t low = Wire.read();
+  uint8_t high = Wire.read();
+
+  value = low | ((uint16_t)high << 8);
+  return true;
+}
+
+// ============================================
+// INITIALIZE MPR121
+// ============================================
+
+bool initializeMPR121() {
+
+  // Reset chip
+  if (!writeReg(0x80, 0x63))
+    return false;
+
+  delay(10);
+
+  // Stop measurements during configuration
+  if (!writeReg(0x5E, 0x00))
+    return false;
+
+  // Rising baseline filter
+  if (!writeReg(0x2B, 0x01)) return false;
+  if (!writeReg(0x2C, 0x01)) return false;
+  if (!writeReg(0x2D, 0x0E)) return false;
+  if (!writeReg(0x2E, 0x00)) return false;
+
+  // Falling baseline filter
+  if (!writeReg(0x2F, 0x01)) return false;
+  if (!writeReg(0x30, 0x05)) return false;
+  if (!writeReg(0x31, 0x01)) return false;
+  if (!writeReg(0x32, 0x00)) return false;
+
+  // Touched baseline filter
+  if (!writeReg(0x33, 0x00)) return false;
+  if (!writeReg(0x34, 0x00)) return false;
+  if (!writeReg(0x35, 0x00)) return false;
+
+  // Internal thresholds
+  // We do NOT use their touch status results
+  for (int i = 0; i < NUM_PADS; i++) {
+    if (!writeReg(0x41 + 2*i, 12))
+      return false;
+
+    if (!writeReg(0x42 + 2*i, 6))
+      return false;
+  }
+
+  // Debounce, AFE configuration, filter delay
+  if (!writeReg(0x5B, 0x00)) return false;
+  if (!writeReg(0x5C, 0x10)) return false;
+  if (!writeReg(0x5D, 0x20)) return false;
+
+  // Enable E0-E2 with baseline initialization
+  if (!writeReg(0x5E, 0x83))
+    return false;
+
+  delay(400);
+  return true;
+}
+
+// ============================================
+// READ MPR121 MEASUREMENT DATA
+// ============================================
+
+bool readPadData(
+  int pad,
+  int &filtered,
+  int &baseline,
+  int &delta
+) {
+  uint16_t rawFiltered;
+  uint8_t rawBaseline;
+
+  if (!readReg16(0x04 + 2*pad,
+                 rawFiltered))
+    return false;
+
+  if (!readReg8(0x1E + pad,
+                rawBaseline))
+    return false;
+
+  filtered = rawFiltered & 0x03FF;
+  baseline = ((int)rawBaseline) << 2;
+  delta = baseline - filtered;
+
+  return true;
+}
+
+// ============================================
+// CUSTOM PAD TOUCH DETECTION
+// Returns bitmask of NEW touch events
+// ============================================
+
+uint8_t readPads() {
+
+  if (!mprConnected)
+    return 0;
+
+  uint8_t newTouches = 0;
+
+  for (int i = 0; i < NUM_PADS; i++) {
+
+    int filtered, baseline, delta;
+
+    if (!readPadData(
+        i, filtered, baseline, delta)) {
+      continue;
+    }
+
+    if (!padState[i]) {
+
+      // Confirm new touch over two samples
+      if (delta >= touchThreshold[i]) {
+        if (++padCount[i] >= 2) {
+
+          padState[i] = true;
+          padCount[i] = 0;
+
+          newTouches |= (1 << i);
+        }
+      } else {
+        padCount[i] = 0;
+      }
+
+    } else {
+
+      // Confirm release over two samples
+      if (delta <= releaseThreshold[i]) {
+        if (++padCount[i] >= 2) {
+          padState[i] = false;
+          padCount[i] = 0;
+        }
+      } else {
+        padCount[i] = 0;
+      }
+    }
+  }
+
+  return newTouches;
+}
+
+// Initialize pad states so already-held pads
+// are not counted as fresh touches
+void primePads() {
+  if (!mprConnected)
+    return;
+
+  for (int i = 0; i < NUM_PADS; i++) {
+    int filtered, baseline, delta;
+
+    if (readPadData(i, filtered,
+                    baseline, delta)) {
+      padState[i] =
+        (delta >= touchThreshold[i]);
+    }
+
+    padCount[i] = 0;
+  }
+}
+
+// ============================================
+// ANALOG SENSOR CALIBRATION
+// ============================================
+
+void calibrateAnalog() {
+  slideStart = analogRead(SLIDE_PIN);
+  spinStart = analogRead(SPIN_PIN);
+}
+
+bool readSlide() {
+  int current = analogRead(SLIDE_PIN);
+
+  return abs(current - slideStart)
+         >= SLIDE_THRESHOLD;
+}
+
+bool readSpin() {
+  int current = analogRead(SPIN_PIN);
+
+  return abs(current - spinStart)
+         >= SPIN_THRESHOLD;
+}
+
+// ============================================
+// LED FEEDBACK
+// ============================================
+
+void flashLED(int count, int duration) {
+
+  for (int i = 0; i < count; i++) {
+    digitalWrite(LED_PIN, HIGH);
+    delay(duration);
+
+    digitalWrite(LED_PIN, LOW);
+    delay(duration);
+  }
+}
+
+// ============================================
+// HARDWARE SETUP
+// ============================================
+
+void setupHardware() {
+
+  pinMode(START_PIN, INPUT_PULLUP);
+  pinMode(LED_PIN, OUTPUT);
+
+  pinMode(SLIDE_PIN, INPUT);
+  pinMode(SPIN_PIN, INPUT);
+
+  digitalWrite(LED_PIN, LOW);
+
+  analogReadResolution(12);
+
+  analogSetPinAttenuation(
+    SLIDE_PIN, ADC_11db);
+
+  analogSetPinAttenuation(
+    SPIN_PIN, ADC_11db);
+
+  Wire.begin(SDA_PIN, SCL_PIN);
+  Wire.setClock(100000);
+  Wire.setTimeOut(50);
+
+  Serial.println("Initializing hardware...");
+
+  Wire.beginTransmission(MPR_ADDR);
+  bool detected =
+      (Wire.endTransmission() == 0);
+
+  if (detected) {
+    mprConnected = initializeMPR121();
+  }
+
+  Serial.print("MPR121: ");
+  Serial.println(
+    mprConnected ? "CONNECTED" : "NOT FOUND"
+  );
+
+  Serial.println("Slide ADC: GPIO 4");
+  Serial.println("Spin ADC: GPIO 6");
+  Serial.println("START: GPIO 5");
+  Serial.println("LED: GPIO 18");
+
+  if (!mprConnected) {
+    Serial.println(
+      "TAP IT disabled until sensor connects."
+    );
+  }
+
+  delay(500);
+}
+
+// ============================================
+// WAIT FOR START BUTTON
+// ============================================
+
+void waitForStart() {
+
+  Serial.println();
+  Serial.println("======================");
+  Serial.println("       DJ BOP-IT");
+  Serial.println("======================");
+  Serial.println("Press START to play!");
+
+  while (digitalRead(START_PIN) == LOW) {
+    delay(10);
+  }
+
+  // Wait for new button press
+  while (digitalRead(START_PIN) == HIGH) {
+    if (mprConnected)
+      readPads();
+
+    delay(10);
+  }
+
+  delay(30);
+
+  // Wait for release
+  while (digitalRead(START_PIN) == LOW) {
+    delay(10);
+  }
+
+  Serial.println("GAME STARTED!");
+
+  primePads();
+  flashLED(2, 100);
+}
+
+// ============================================
+// PICK RANDOM COMMAND
+// ============================================
+
+Command pickRandomCommand() {
+
+  Command available[3];
+  int count = 0;
+
+  if (mprConnected) {
+    available[count++] = TAP_IT;
+  }
+
+  available[count++] = SPIN_IT;
+  available[count++] = SLIDE_IT;
+
+  return available[random(count)];
+}
+
+// ============================================
+// ISSUE GAME COMMAND
+// ============================================
+
+void issueCommand(Command cmd) {
+
+  Serial.println();
+  Serial.println("----------------------");
+
+  switch (cmd) {
+
+    case TAP_IT:
+      Serial.println(">>> TAP IT! <<<");
+      Serial.println("Touch E0, E1, or E2");
+      break;
+
+    case SPIN_IT:
+      Serial.println(">>> SPIN IT! <<<");
+      Serial.println("Turn the rotary knob");
+      break;
+
+    case SLIDE_IT:
+      Serial.println(">>> SLIDE IT! <<<");
+      Serial.println("Move the slide fader");
+      break;
+  }
+}
+
+// ============================================
+// WAIT FOR PLAYER RESPONSE
+// ============================================
+
+Result waitForResponse(
+  Command cmd,
+  unsigned long timeLimit
+) {
+
+  calibrateAnalog();
+
+  unsigned long startTime = millis();
+
+  while (millis() - startTime < timeLimit) {
+
+    bool tapDetected = false;
+    bool spinDetected = false;
+    bool slideDetected = false;
+
+    // MPR121 custom software touch
+    uint8_t padEvents = readPads();
+
+    tapDetected = (padEvents != 0);
+
+    // Rotary potentiometer
+    spinDetected = readSpin();
+
+    // Slide potentiometer
+    slideDetected = readSlide();
+
+    // Wrong inputs take priority
+    if (tapDetected && cmd != TAP_IT)
+      return WRONG;
+
+    if (spinDetected && cmd != SPIN_IT)
+      return WRONG;
+
+    if (slideDetected && cmd != SLIDE_IT)
+      return WRONG;
+
+    // Correct response
+    if (cmd == TAP_IT && tapDetected) {
+      Serial.println("Touch pad detected!");
+      return CORRECT;
+    }
+
+    if (cmd == SPIN_IT && spinDetected) {
+      Serial.println("Rotation detected!");
+      return CORRECT;
+    }
+
+    if (cmd == SLIDE_IT && slideDetected) {
+      Serial.println("Slide detected!");
+      return CORRECT;
+    }
+
+    delay(10);
+  }
+
+  return TIMEOUT;
+}
+
+// ============================================
+// SUCCESS / FAILURE
+// ============================================
+
+void showSuccess() {
+  Serial.println("CORRECT!");
+  flashLED(1, 150);
+}
+
+void showFailure(Result result) {
+
+  if (result == TIMEOUT) {
+    Serial.println("TOO SLOW!");
+  } else {
+    Serial.println("WRONG INPUT!");
+  }
+
+  Serial.println("GAME OVER!");
+  flashLED(3, 100);
+}
+
+// ============================================
+// SPEED UP GAME
+// ============================================
+
+void speedUp() {
+
+  if (responseTime > MIN_TIME + SPEED_STEP) {
+    responseTime -= SPEED_STEP;
+  } else {
+    responseTime = MIN_TIME;
+  }
+}
+
+// ============================================
+// SCORE + COMBO
+// ============================================
+
+void updateDisplay() {
+
+  Serial.print("Score: ");
+  Serial.print(score);
+
+  Serial.print(" | Combo: ");
+  Serial.print(combo);
+
+  Serial.print(" | Response time: ");
+  Serial.print(responseTime);
+  Serial.println(" ms");
+}
+
+// ============================================
+// FINAL SCORE
+// ============================================
+
+void displayFinalScore() {
+
+  Serial.println();
+  Serial.println("======================");
+  Serial.println("      FINAL SCORE");
+  Serial.println("======================");
+
+  Serial.print("Score: ");
+  Serial.println(score);
+
+  if (score >= 99) {
+    Serial.println("YOU WIN!");
+    Serial.println("RANK: DJ MASTER");
+  }
+  else if (score >= 50) {
+    Serial.println("RANK: PRO DJ");
+  }
+  else if (score >= 20) {
+    Serial.println("RANK: CLUB DJ");
+  }
+  else {
+    Serial.println("RANK: BEGINNER");
+  }
+
+  Serial.println("======================");
+}
+
+// ============================================
+// ARDUINO SETUP
+// ============================================
+
+void setup() {
+
+  Serial.begin(115200);
+  delay(1500);
+
+  randomSeed(micros());
+
+  setupHardware();
+
+  Serial.println();
+  Serial.println("ESP32-S3 DJ BOP-IT READY!");
+}
+
+// ============================================
+// MAIN GAME LOOP
+// ============================================
+
+void loop() {
+
+  if (REQUIRE_ALL_SENSORS &&
+      !mprConnected) {
+
+    Serial.println("MPR121 required!");
+    Serial.println("Check wiring and reset.");
+
+    delay(3000);
+    return;
+  }
+
+  waitForStart();
+
+  score = 0;
+  combo = 0;
+  responseTime = INITIAL_TIME;
+
+  bool gameRunning = true;
+
+  while (gameRunning && score < WIN_SCORE) {
+
+    // Keep tracking touch-pad releases
+    if (mprConnected)
+      readPads();
+
+    Command command = pickRandomCommand();
+
+    issueCommand(command);
+
+    Result result =
+      waitForResponse(command, responseTime);
+
+    if (result == CORRECT) {
+
+      score++;
+      combo++;
+
+      showSuccess();
+      speedUp();
+      updateDisplay();
+
+      // Keep updating touch states
+      unsigned long pauseStart = millis();
+
+      while (millis() - pauseStart < 300) {
+        if (mprConnected)
+          readPads();
+
+        delay(10);
+      }
+
+    } else {
+
+      combo = 0;
+      showFailure(result);
+
+      gameRunning = false;
+    }
+  }
+
+  displayFinalScore();
+
+  Serial.println();
+  Serial.println("Press START to restart.");
+
+  delay(500);
+}
