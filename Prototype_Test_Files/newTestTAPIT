@@ -1,0 +1,254 @@
+#include <Arduino.h>
+#include <Wire.h>
+
+// =====================================
+// DJ BOP-IT - RAW MPR121 TEST
+// ESP32-S3 | E0, E1, E2
+// No Adafruit library
+// =====================================
+
+#define SDA_PIN 8
+#define SCL_PIN 9
+#define MPR_ADDR 0x5A
+
+const int NUM_PADS = 3;
+
+// Software detection thresholds
+// Adjust after examining actual deltas
+int touchThreshold[3] = {10, 10, 10};
+int releaseThreshold[3] = {5, 5, 5};
+
+bool padState[3] = {false, false, false};
+
+// -------------------------------------
+// I2C REGISTER FUNCTIONS
+// -------------------------------------
+
+bool writeReg(uint8_t reg, uint8_t value) {
+  Wire.beginTransmission(MPR_ADDR);
+  Wire.write(reg);
+  Wire.write(value);
+
+  return Wire.endTransmission() == 0;
+}
+
+bool readReg8(uint8_t reg, uint8_t &value) {
+  Wire.beginTransmission(MPR_ADDR);
+  Wire.write(reg);
+
+  if (Wire.endTransmission(false) != 0)
+    return false;
+
+  if (Wire.requestFrom(
+      (uint8_t)MPR_ADDR, (uint8_t)1) != 1)
+    return false;
+
+  value = Wire.read();
+  return true;
+}
+
+bool readReg16(uint8_t reg, uint16_t &value) {
+  Wire.beginTransmission(MPR_ADDR);
+  Wire.write(reg);
+
+  if (Wire.endTransmission(false) != 0)
+    return false;
+
+  if (Wire.requestFrom(
+      (uint8_t)MPR_ADDR, (uint8_t)2) != 2)
+    return false;
+
+  uint8_t lowByte = Wire.read();
+  uint8_t highByte = Wire.read();
+
+  value = lowByte | ((uint16_t)highByte << 8);
+
+  return true;
+}
+
+// -------------------------------------
+// INITIALIZE MPR121
+// -------------------------------------
+
+bool initMPR121() {
+
+  // Reset sensor
+  if (!writeReg(0x80, 0x63)) return false;
+  delay(10);
+
+  // Stop mode for configuration
+  if (!writeReg(0x5E, 0x00)) return false;
+
+  // Rising baseline filter
+  if (!writeReg(0x2B, 0x01)) return false;
+  if (!writeReg(0x2C, 0x01)) return false;
+  if (!writeReg(0x2D, 0x0E)) return false;
+  if (!writeReg(0x2E, 0x00)) return false;
+
+  // Falling baseline filter
+  if (!writeReg(0x2F, 0x01)) return false;
+  if (!writeReg(0x30, 0x05)) return false;
+  if (!writeReg(0x31, 0x01)) return false;
+  if (!writeReg(0x32, 0x00)) return false;
+
+  // Touched baseline filter
+  if (!writeReg(0x33, 0x00)) return false;
+  if (!writeReg(0x34, 0x00)) return false;
+  if (!writeReg(0x35, 0x00)) return false;
+
+  // Configure internal thresholds
+  // Not used for our event detection
+  for (int i = 0; i < NUM_PADS; i++) {
+    if (!writeReg(0x41 + 2*i, 12))
+      return false;
+
+    if (!writeReg(0x42 + 2*i, 6))
+      return false;
+  }
+
+  // Debounce and measurement settings
+  if (!writeReg(0x5B, 0x00)) return false;
+  if (!writeReg(0x5C, 0x10)) return false;
+  if (!writeReg(0x5D, 0x20)) return false;
+
+  // Enable electrodes E0-E2
+  // Baseline auto-initialization enabled
+  if (!writeReg(0x5E, 0x83)) return false;
+
+  delay(500);
+
+  return true;
+}
+
+// -------------------------------------
+// READ SENSOR MEASUREMENTS
+// -------------------------------------
+
+bool readPad(int pad,
+             int &filtered,
+             int &baseline,
+             int &delta) {
+
+  uint16_t filteredRaw;
+  uint8_t baselineRaw;
+
+  // Filtered register: E0=0x04,
+  // E1=0x06, E2=0x08
+  uint8_t filteredReg = 0x04 + 2*pad;
+
+  // Baseline register:
+  // E0=0x1E, E1=0x1F, E2=0x20
+  uint8_t baselineReg = 0x1E + pad;
+
+  if (!readReg16(filteredReg, filteredRaw))
+    return false;
+
+  if (!readReg8(baselineReg, baselineRaw))
+    return false;
+
+  filtered = filteredRaw & 0x03FF;
+  baseline = baselineRaw << 2;
+
+  delta = baseline - filtered;
+
+  return true;
+}
+
+// -------------------------------------
+// CUSTOM TOUCH DETECTION
+// -------------------------------------
+
+void checkPad(int pad) {
+
+  int filtered, baseline, delta;
+
+  if (!readPad(pad, filtered, baseline, delta)) {
+    Serial.print("E");
+    Serial.print(pad);
+    Serial.println(" READ ERROR");
+    return;
+  }
+
+  // Print sensor measurements
+  Serial.print("E");
+  Serial.print(pad);
+
+  Serial.print(" | Filtered: ");
+  Serial.print(filtered);
+
+  Serial.print(" | Baseline: ");
+  Serial.print(baseline);
+
+  Serial.print(" | Delta: ");
+  Serial.print(delta);
+
+  // Detect new touch
+  if (!padState[pad] &&
+      delta >= touchThreshold[pad]) {
+
+    padState[pad] = true;
+
+    Serial.print(" | >>> TAP IT! PAD ");
+    Serial.print(pad);
+    Serial.print(" TOUCHED <<<");
+  }
+
+  // Detect release
+  else if (padState[pad] &&
+           delta <= releaseThreshold[pad]) {
+
+    padState[pad] = false;
+
+    Serial.print(" | PAD ");
+    Serial.print(pad);
+    Serial.print(" RELEASED");
+  }
+
+  Serial.println();
+}
+
+// -------------------------------------
+// SETUP
+// -------------------------------------
+
+void setup() {
+  Serial.begin(115200);
+  delay(1500);
+
+  Wire.begin(SDA_PIN, SCL_PIN);
+  Wire.setClock(100000);
+
+  Serial.println();
+  Serial.println("=======================");
+  Serial.println("DJ BOP-IT RAW TAP TEST");
+  Serial.println("=======================");
+
+  Wire.beginTransmission(MPR_ADDR);
+
+  if (Wire.endTransmission() != 0) {
+    Serial.println("MPR121 NOT DETECTED");
+    while (true) delay(1000);
+  }
+
+  if (!initMPR121()) {
+    Serial.println("MPR121 SETUP FAILED");
+    while (true) delay(1000);
+  }
+
+  Serial.println("MPR121 CONNECTED!");
+  Serial.println("Touch E0, E1, or E2.");
+}
+
+// -------------------------------------
+// MAIN LOOP
+// -------------------------------------
+
+void loop() {
+
+  for (int pad = 0; pad < NUM_PADS; pad++) {
+    checkPad(pad);
+  }
+
+  Serial.println("-----------------------");
+  delay(100);
+}
