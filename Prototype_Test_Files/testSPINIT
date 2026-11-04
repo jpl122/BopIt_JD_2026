@@ -1,0 +1,51 @@
+#include <Arduino.h>
+
+// DJ BOP-IT: SPIN IT TEST
+// ESP32-S3 + Bourns 3590S
+
+#define SPIN_PIN 6
+
+// Movement threshold in ADC counts
+const int SPIN_THRESHOLD = 80;
+
+int startingPosition = 0;
+bool spinDetected = false;
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  pinMode(SPIN_PIN, INPUT);
+  analogReadResolution(12);
+  analogSetPinAttenuation(SPIN_PIN, ADC_11db);
+
+  startingPosition = analogRead(SPIN_PIN);
+
+  Serial.println("SPIN IT TEST READY!");
+  Serial.println("Rotate the potentiometer.");
+}
+
+void loop() {
+  int currentPosition = analogRead(SPIN_PIN);
+
+  int movement =
+      abs(currentPosition - startingPosition);
+
+  Serial.print("Position: ");
+  Serial.print(currentPosition);
+
+  Serial.print(" | Movement: ");
+  Serial.println(movement);
+
+  if (!spinDetected &&
+      movement >= SPIN_THRESHOLD) {
+
+    spinDetected = true;
+
+    Serial.println(
+      ">>> SPIN IT DETECTED! <<<"
+    );
+  }
+
+  delay(100);
+}
